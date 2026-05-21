@@ -1,6 +1,12 @@
 """
-Watch ben-ran.timepad.ru for new active events.
-Uses Timepad's public events endpoint instead of parsing HTML — more robust.
+Watch ben-ran.timepad.ru events page for new active events.
+
+Strategy:
+  - Fetch /events/all/page/N/ (server-rendered HTML)
+  - Parse div.t-card_event cards
+  - Exclude cards with class 't-card_event__passed' (past events)
+  - Track by numeric event id (from /event/<id>/ URL)
+  - Send Telegram message when a new active id appears
 
 Env vars:
   TELEGRAM_TOKEN   - bot token
@@ -11,19 +17,18 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
+from bs4 import BeautifulSoup, Tag
 
-# ---- target ----
-ORG_ID = 239824
 SITE_LABEL = "БЕН РАН (Timepad)"
-SITE_URL = "https://ben-ran.timepad.ru/events/"
-API = "https://api.timepad.ru/v1/events"
-# ----------------
+BASE_URL = "https://ben-ran.timepad.ru/events/"
+PAGE_URL = "https://ben-ran.timepad.ru/events/all/page/{page}/"
 
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
 
@@ -31,65 +36,107 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 HEADERS = {
-    "User-Agent": "ben-ran-watcher/1.0 (https://github.com/tatianajagoda-debug)",
-    "Accept": "application/json",
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8",
 }
 
+EVENT_ID_RE = re.compile(r"/event/(\d+)/?")
 
-def fetch_events() -> list[dict]:
-    """Fetch up to 200 of the most-recently-starting public events."""
+
+def fetch_url(url: str) -> str:
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            time.sleep(2 + attempt * 2)
+    raise RuntimeError(f"Failed to fetch {url}: {last_err}")
+
+
+def total_pages(html: str) -> int:
+    soup = BeautifulSoup(html, "html.parser")
+    # Pagination links: /events/all/page/N/
+    nums = set()
+    for a in soup.find_all("a", href=True):
+        m = re.search(r"/events/all/page/(\d+)/?", a["href"])
+        if m:
+            nums.add(int(m.group(1)))
+    if not nums:
+        return 1
+    return max(nums)
+
+
+def parse_cards(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "html.parser")
     out: list[dict] = []
-    for skip in (0, 100):
-        params = {
-            "organization_ids": ORG_ID,
-            "limit": 100,
-            "skip": skip,
-            "access_statuses": "public",
-            "fields": "id,name,starts_at,ends_at,url,access_status,location",
-            "sort": "-starts_at",
-        }
-        last_err = None
-        for attempt in range(3):
-            try:
-                r = requests.get(API, params=params, headers=HEADERS, timeout=30)
-                r.raise_for_status()
-                data = r.json()
-                values = data.get("values", [])
-                out.extend(values)
-                # If fewer than 100 returned, no more pages.
-                if len(values) < 100:
-                    return out
+    for card in soup.select("div.t-card.t-card_event, div.t-card_event"):
+        classes = card.get("class") or []
+        if "t-card_event__passed" in classes:
+            # past event — skip
+            continue
+        # Find a link to /event/<id>/
+        link = None
+        eid = None
+        for a in card.find_all("a", href=True):
+            m = EVENT_ID_RE.search(a["href"])
+            if m:
+                eid = m.group(1)
+                link = a["href"]
                 break
-            except Exception as e:  # noqa: BLE001
-                last_err = e
-                time.sleep(2 + attempt * 2)
+        if not eid:
+            continue
+        # Title: prefer h1/h2/h3 text
+        title = None
+        for h in card.select("h1, h2, h3, h4"):
+            t = h.get_text(" ", strip=True)
+            if t:
+                title = t
+                break
+        if not title:
+            # Fallback: longest link text
+            for a in card.find_all("a", href=True):
+                t = a.get_text(" ", strip=True)
+                if t and (not title or len(t) > len(title)):
+                    title = t
+        if not title:
+            continue
+        # Normalize URL
+        if link.startswith("/"):
+            url = "https://ben-ran.timepad.ru" + link
         else:
-            raise RuntimeError(f"API call failed (skip={skip}): {last_err}")
+            url = link
+        out.append({"id": eid, "title": title, "url": url})
     return out
 
 
-def parse_dt(raw: str | None) -> datetime | None:
-    if not raw:
-        return None
-    try:
-        # Timepad uses "YYYY-MM-DD HH:MM:SS+HH:MM" or ISO
-        s = raw.replace(" ", "T") if "T" not in raw else raw
-        s = s.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        # Assume Moscow time if Timepad didn't include tz
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def is_active(event: dict, now: datetime) -> bool:
-    """Active = event still upcoming or currently ongoing."""
-    end = parse_dt(event.get("ends_at")) or parse_dt(event.get("starts_at"))
-    if not end:
-        return False
-    return end >= now
+def fetch_all_active() -> list[dict]:
+    page1 = fetch_url(PAGE_URL.format(page=1))
+    pages = min(total_pages(page1), 20)
+    items = parse_cards(page1)
+    for p in range(2, pages + 1):
+        try:
+            html = fetch_url(PAGE_URL.format(page=p))
+        except Exception as e:  # noqa: BLE001
+            print(f"page {p} failed: {e}", file=sys.stderr)
+            return items
+        items.extend(parse_cards(html))
+        time.sleep(1)
+    # Dedup by id
+    seen_ids: set[str] = set()
+    unique: list[dict] = []
+    for it in items:
+        if it["id"] in seen_ids:
+            continue
+        seen_ids.add(it["id"])
+        unique.append(it)
+    return unique
 
 
 def load_state() -> dict:
@@ -133,9 +180,8 @@ def format_message(events: list[dict], total_active: int) -> str:
     lines.append(f"Всего активных: {total_active}")
     lines.append("")
     for e in events[:40]:
-        title = escape_html(e.get("name") or "(без названия)")
-        url = e.get("url") or f"https://ben-ran.timepad.ru/event/{e['id']}/"
-        lines.append(f"• <a href=\"{url}\">{title}</a>")
+        title = escape_html(e["title"])
+        lines.append(f"• <a href=\"{e['url']}\">{title}</a>")
     if len(events) > 40:
         lines.append("")
         lines.append(f"…и ещё {len(events) - 40} (см. сайт)")
@@ -148,37 +194,34 @@ def main() -> int:
     bootstrap = not seen
 
     try:
-        events = fetch_events()
+        items = fetch_all_active()
     except Exception as e:  # noqa: BLE001
-        print(f"API fetch failed: {e}", file=sys.stderr)
+        print(f"Fetch failed: {e}", file=sys.stderr)
         return 2
 
-    now = datetime.now(timezone.utc)
-    active = [e for e in events if is_active(e, now)]
-
-    if not active and state.get("last_count", 0) > 3:
+    if not items and state.get("last_count", 0) > 3:
         print(
-            f"Suspicious: 0 active events now but state had {state.get('last_count')}. "
+            f"Suspicious: 0 items but state had {state.get('last_count')}. "
             "Aborting without state update.",
             file=sys.stderr,
         )
         return 3
 
-    current_ids = {str(e["id"]) for e in active}
+    current_ids = {it["id"] for it in items}
+    by_id = {it["id"]: it for it in items}
     new_ids = current_ids - seen
 
-    print(f"Fetched: {len(events)}, active: {len(active)}, new: {len(new_ids)}")
+    print(f"Active: {len(items)}, new: {len(new_ids)}")
 
     if bootstrap:
         print("First run — recording state without notifications")
     elif new_ids:
-        new_events = [e for e in active if str(e["id"]) in new_ids]
-        new_events.sort(key=lambda x: parse_dt(x.get("starts_at")) or now)
-        send_telegram(format_message(new_events, len(active)))
+        new_events = [by_id[i] for i in new_ids]
+        send_telegram(format_message(new_events, len(items)))
 
     state["seen"] = sorted(current_ids)
-    state["last_run"] = now.strftime("%Y-%m-%d %H:%M:%S UTC")
-    state["last_count"] = len(active)
+    state["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    state["last_count"] = len(items)
     save_state(state)
     return 0
 
