@@ -2,7 +2,8 @@
 Watch ben-ran.timepad.ru events page for new active events.
 
 Strategy:
-  - Fetch /events/all/page/N/ (server-rendered HTML)
+  - Use Playwright (headless Chromium) to fetch /events/all/page/N/
+    — bypasses Cloudflare anti-bot that blocks plain requests
   - Parse div.t-card_event cards
   - Exclude cards with class 't-card_event__passed' (past events)
   - Track by numeric event id (from /event/<id>/ URL)
@@ -19,15 +20,14 @@ import json
 import os
 import re
 import sys
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
 SITE_LABEL = "БЕН РАН (Timepad)"
-BASE_URL = "https://ben-ran.timepad.ru/events/"
 PAGE_URL = "https://ben-ran.timepad.ru/events/all/page/{page}/"
 
 STATE_FILE = Path(__file__).resolve().parent / "state.json"
@@ -35,50 +35,62 @@ STATE_FILE = Path(__file__).resolve().parent / "state.json"
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8,"
-        "application/signed-exchange;v=b3;q=0.7"
-    ),
-    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Sec-Ch-Ua": "\"Chromium\";v=\"124\", \"Google Chrome\";v=\"124\", \"Not-A.Brand\";v=\"99\"",
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": "\"Windows\"",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Upgrade-Insecure-Requests": "1",
-    "Referer": "https://ben-ran.timepad.ru/",
-}
-
 EVENT_ID_RE = re.compile(r"/event/(\d+)/?")
 
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
-def fetch_url(url: str) -> str:
-    last_err = None
-    for attempt in range(3):
+
+def fetch_pages_with_playwright() -> list[str]:
+    """Visit pages 1..N and return their rendered HTML."""
+    htmls: list[str] = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        ctx = browser.new_context(
+            user_agent=USER_AGENT,
+            locale="ru-RU",
+            viewport={"width": 1280, "height": 800},
+        )
+        # Strip the webdriver flag
+        ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });"
+        )
+        page = ctx.new_page()
+
+        # Page 1 — also yields the pagination info
+        page.goto(PAGE_URL.format(page=1), wait_until="domcontentloaded", timeout=60000)
         try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            time.sleep(2 + attempt * 2)
-    raise RuntimeError(f"Failed to fetch {url}: {last_err}")
+            page.wait_for_selector("div.t-card_event", timeout=15000)
+        except Exception:  # noqa: BLE001
+            pass
+        htmls.append(page.content())
+
+        # Determine total pages from page 1
+        total = total_pages(htmls[0])
+        total = min(total, 20)
+
+        for n in range(2, total + 1):
+            page.goto(PAGE_URL.format(page=n), wait_until="domcontentloaded", timeout=60000)
+            try:
+                page.wait_for_selector("div.t-card_event", timeout=15000)
+            except Exception:  # noqa: BLE001
+                pass
+            htmls.append(page.content())
+
+        browser.close()
+    return htmls
 
 
 def total_pages(html: str) -> int:
     soup = BeautifulSoup(html, "html.parser")
-    # Pagination links: /events/all/page/N/
     nums = set()
     for a in soup.find_all("a", href=True):
         m = re.search(r"/events/all/page/(\d+)/?", a["href"])
@@ -95,9 +107,7 @@ def parse_cards(html: str) -> list[dict]:
     for card in soup.select("div.t-card.t-card_event, div.t-card_event"):
         classes = card.get("class") or []
         if "t-card_event__passed" in classes:
-            # past event — skip
             continue
-        # Find a link to /event/<id>/
         link = None
         eid = None
         for a in card.find_all("a", href=True):
@@ -108,7 +118,6 @@ def parse_cards(html: str) -> list[dict]:
                 break
         if not eid:
             continue
-        # Title: prefer h1/h2/h3 text
         title = None
         for h in card.select("h1, h2, h3, h4"):
             t = h.get_text(" ", strip=True)
@@ -116,35 +125,22 @@ def parse_cards(html: str) -> list[dict]:
                 title = t
                 break
         if not title:
-            # Fallback: longest link text
             for a in card.find_all("a", href=True):
                 t = a.get_text(" ", strip=True)
                 if t and (not title or len(t) > len(title)):
                     title = t
         if not title:
             continue
-        # Normalize URL
-        if link.startswith("/"):
-            url = "https://ben-ran.timepad.ru" + link
-        else:
-            url = link
+        url = ("https://ben-ran.timepad.ru" + link) if link.startswith("/") else link
         out.append({"id": eid, "title": title, "url": url})
     return out
 
 
-def fetch_all_active() -> list[dict]:
-    page1 = fetch_url(PAGE_URL.format(page=1))
-    pages = min(total_pages(page1), 20)
-    items = parse_cards(page1)
-    for p in range(2, pages + 1):
-        try:
-            html = fetch_url(PAGE_URL.format(page=p))
-        except Exception as e:  # noqa: BLE001
-            print(f"page {p} failed: {e}", file=sys.stderr)
-            return items
+def collect_active_events() -> list[dict]:
+    htmls = fetch_pages_with_playwright()
+    items: list[dict] = []
+    for html in htmls:
         items.extend(parse_cards(html))
-        time.sleep(1)
-    # Dedup by id
     seen_ids: set[str] = set()
     unique: list[dict] = []
     for it in items:
@@ -210,7 +206,7 @@ def main() -> int:
     bootstrap = not seen
 
     try:
-        items = fetch_all_active()
+        items = collect_active_events()
     except Exception as e:  # noqa: BLE001
         print(f"Fetch failed: {e}", file=sys.stderr)
         return 2

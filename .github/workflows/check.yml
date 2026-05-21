@@ -2,7 +2,9 @@ name: Check ben-ran.timepad.ru events
 
 on:
   schedule:
-    - cron: "*/20 * * * *"
+    # Каждые 4 часа (00:05, 04:05, ... UTC). Cron в GitHub Actions
+    # не гарантирует точную минуту запуска.
+    - cron: "5 */4 * * *"
   workflow_dispatch: {}
 
 permissions:
@@ -15,6 +17,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,6 +30,9 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Install Playwright browser
+        run: python -m playwright install chromium --with-deps
 
       - name: Run watcher
         env:
